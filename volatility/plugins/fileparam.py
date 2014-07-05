@@ -31,8 +31,8 @@ config = conf.ConfObject()
 
 def set_location(_option, _opt_str, value, parser):
     """Sets the location variable in the parser to the filename in question"""
-    if not os.path.exists(os.path.abspath(value)):
-        debug.error("The requested file doesn't exist")
+    #if not os.path.exists(os.path.abspath(value)):
+    #    debug.error("The requested file doesn't exist")
     if parser.values.location == None:
         slashes = "//"
         # Windows pathname2url decides to convert C:\blah to ///C:/blah
