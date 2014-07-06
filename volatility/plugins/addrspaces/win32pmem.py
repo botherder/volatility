@@ -96,4 +96,7 @@ class Win32FileAddressSpace(addrspace.AbstractRunBasedMemory):
         return data
 		
     def close(self):
-        win32file.CloseHandle(self.fhandle)
+        try:
+            win32file.CloseHandle(self.fhandle)
+        except AttributeError:
+            pass
