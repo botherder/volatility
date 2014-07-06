@@ -56,6 +56,9 @@ class Win32FileAddressSpace(addrspace.AbstractRunBasedMemory):
 			
         self.ParseMemoryRuns()
 
+    def __del__(self):
+        self.close()
+
     FIELDS = (["CR3", "NtBuildNumber", "KernBase", "KDBG"] +
               ["KPCR%02d" % i for i in xrange(32)] +
               ["PfnDataBase", "PsLoadedModuleList", "PsActiveProcessHead"] +
