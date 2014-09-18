@@ -48,6 +48,8 @@ x64_native_types = copy.deepcopy(native_types.x64_native_types)
 x64_native_types['long'] = [8, '<q']
 x64_native_types['unsigned long'] = [8, '<Q']
 
+from operator import attrgetter
+
 class LinuxPermissionFlags(basic.Flags):
     """A Flags object for printing vm_area_struct permissions
     in a format like rwx or r-x"""
@@ -488,13 +490,12 @@ class linux_file(obj.CType):
 class hlist_node(obj.CType):
     """A hlist_node makes a doubly linked list."""
     def list_of_type(self, obj_type, member, offset = -1, forward = True, head_sentinel = True):
-
         if not self.is_valid():
             return
 
         ## Get the first element
         if forward:
-            nxt = self.next.dereference()
+            nxt = self.m("next").dereference()
         else:
             nxt = self.pprev.dereference().dereference()
 
@@ -517,7 +518,7 @@ class hlist_node(obj.CType):
             yield item
 
             if forward:
-                nxt = item.m(member).next.dereference()
+                nxt = item.m(member).m("next").dereference()
             else:
                 nxt = item.m(member).pprev.dereference().dereference()
 
@@ -560,10 +561,11 @@ class list_head(obj.CType):
             yield item
 
             if forward:
-                nxt = item.m(member).next.dereference()
+                nxt = item.m(member).m("next").dereference()
             else:
                 nxt = item.m(member).prev.dereference()
 
+    
     def __nonzero__(self):
         ## List entries are valid when both Flinks and Blink are valid
         return bool(self.next) or bool(self.prev)
@@ -743,7 +745,6 @@ class inet_sock(obj.CType):
 
     @property
     def dst_addr(self):
-
         if self.sk.__sk_common.skc_family == socket.AF_INET:
             # FIXME: Consider using kernel version metadata rather than checking hasattr
             if hasattr(self, "daddr") and self.daddr:
@@ -755,8 +756,11 @@ class inet_sock(obj.CType):
 
             return daddr.cast("IpAddress")
         else:
-            return self.pinet6.daddr.cast("Ipv6Address")
-    
+            if hasattr(self.pinet6, "daddr"):
+                return self.pinet6.daddr.cast("Ipv6Address")
+            else:
+                return self.sk.__sk_common.skc_v6_daddr.cast("Ipv6Address") #pylint: disable-msg=W0212
+
 class tty_ldisc(obj.CType):
 
     @property
@@ -780,15 +784,17 @@ class in_device(obj.CType):
 class net_device(obj.CType):
     
     @property
-    def mac_addr(self):
+    def mac_addr(self):        
+        macaddr = "00:00:00:00:00:00"
 
         if self.members.has_key("perm_addr"):
             hwaddr = self.perm_addr
-        else:
-            hwaddr = self.dev_addr
-
-        macaddr = ":".join(["{0:02x}".format(x) for x in hwaddr][:6])
-
+            macaddr = ":".join(["{0:02x}".format(x) for x in hwaddr][:6])
+        
+        if macaddr == "00:00:00:00:00:00":
+            hwaddr = self.obj_vm.zread(self.dev_addr, 6)
+            macaddr = ":".join(["{0:02x}".format(ord(x)) for x in hwaddr][:6])
+                        
         return macaddr
 
     @property
@@ -941,6 +947,105 @@ class module_struct(obj.CType):
 
         return ret       
 
+
+class vm_area_struct(obj.CType):
+    def vm_name(self, task):
+        if self.vm_file:
+            fname = linux_common.get_path(task, self.vm_file)
+        elif self.vm_start <= task.mm.start_brk and self.vm_end >= task.mm.brk:
+            fname = "[heap]"
+        elif self.vm_start <= task.mm.start_stack and self.vm_end >= task.mm.start_stack:
+            fname = "[stack]"
+        elif self.vm_start == self.vm_mm.context.vdso:
+            fname = "[vdso]"
+        else:
+            fname = "Anonymous Mapping"
+
+        return fname
+
+    extended_flags = {
+        0x00000001 : "VM_READ",
+        0x00000002 : "VM_WRITE",
+        0x00000004 : "VM_EXEC",
+        0x00000008 : "VM_SHARED",
+        0x00000010 : "VM_MAYREAD",
+        0x00000020 : "VM_MAYWRITE",
+        0x00000040 : "VM_MAYEXEC",
+        0x00000080 : "VM_MAYSHARE",
+        0x00000100 : "VM_GROWSDOWN",
+        0x00000200 : "VM_NOHUGEPAGE",
+        0x00000400 : "VM_PFNMAP",
+        0x00000800 : "VM_DENYWRITE",
+        0x00001000 : "VM_EXECUTABLE",
+        0x00002000 : "VM_LOCKED",
+        0x00004000 : "VM_IO",
+        0x00008000 : "VM_SEQ_READ",
+        0x00010000 : "VM_RAND_READ",        
+        0x00020000 : "VM_DONTCOPY", 
+        0x00040000 : "VM_DONTEXPAND",
+        0x00080000 : "VM_RESERVED",
+        0x00100000 : "VM_ACCOUNT",
+        0x00200000 : "VM_NORESERVE",
+        0x00400000 : "VM_HUGETLB",
+        0x00800000 : "VM_NONLINEAR",        
+        0x01000000 : "VM_MAPPED_COP__VM_HUGEPAGE",
+        0x02000000 : "VM_INSERTPAGE",
+        0x04000000 : "VM_ALWAYSDUMP",
+        0x08000000 : "VM_CAN_NONLINEAR",
+        0x10000000 : "VM_MIXEDMAP",
+        0x20000000 : "VM_SAO",
+        0x40000000 : "VM_PFN_AT_MMAP",
+        0x80000000 : "VM_MERGEABLE",
+    }
+
+    def _parse_perms(self, flags):
+        fstr = ""
+
+        for mask in sorted(self.extended_flags.keys()):
+            if flags & mask == mask:
+                fstr = fstr + self.extended_flags[mask] + "|"
+ 
+        if len(fstr) != 0:
+            fstr = fstr[:-1]
+
+        return fstr
+
+    def protection(self):
+        return self._parse_perms(self.vm_flags.v() & 0b1111) 
+
+    def flags(self):
+        return self._parse_perms(self.vm_flags.v())
+
+    # used by malfind
+    def is_suspicious(self):
+        ret = False        
+
+        flags_str  = self.flags()
+       
+        if flags_str == "VM_READ|VM_WRITE|VM_EXEC":
+           ret = True 
+
+        elif flags_str == "VM_READ|VM_EXEC" and not self.vm_file:
+            ret = True
+
+        return ret
+
+    def info(self, task):
+        if self.vm_file:
+            inode = self.vm_file.dentry.d_inode
+            major, minor = inode.i_sb.major, inode.i_sb.minor
+            ino = inode.i_ino
+            pgoff = self.vm_pgoff << 12
+        else:
+            (major, minor, ino, pgoff) = [0] * 4
+
+        fname = self.vm_name(task)
+
+        if fname == "Anonymous Mapping":
+            fname = ""
+
+        return fname, major, minor, ino, pgoff 
+
 class task_struct(obj.CType):
     def is_valid_task(self):
 
@@ -955,7 +1060,10 @@ class task_struct(obj.CType):
     def uid(self):
         ret = self.members.get("uid")
         if ret is None:
-            ret = self.cred.uid
+            if hasattr(self.cred.uid, "val"):
+                ret = self.cred.uid.val
+            else:
+                ret = self.cred.uid
         else:
             ret = self.m("uid")
 
@@ -968,6 +1076,8 @@ class task_struct(obj.CType):
             gid = self.cred.gid
             if hasattr(gid, 'counter'):
                 ret = obj.Object("int", offset = gid.v(), vm = self.obj_vm)
+            elif hasattr(gid, "val"):
+                ret = gid.val
             else:
                 ret = gid
         else:
@@ -985,8 +1095,382 @@ class task_struct(obj.CType):
 
         return ret
 
+    def find_heap_vma(self):
+        ret = None
+
+        for vma in self.get_proc_maps():
+            # find the data section of bash
+            if vma.vm_start <= self.mm.start_brk and vma.vm_end >= self.mm.brk:
+                ret = vma
+                break
+
+        return ret
+
+    def bash_hash_entries(self):
+        nbuckets_offset = self.obj_vm.profile.get_obj_offset("_bash_hash_table", "nbuckets") 
+        
+        heap_vma = self.find_heap_vma()
+
+        if heap_vma == None:
+            debug.debug("Unable to find heap for pid %d" % self.pid)
+            return
+
+        proc_as = self.get_process_address_space()
+
+        for off in self.search_process_memory(["\x40\x00\x00\x00"], heap_only=True):
+            # test the number of buckets
+            htable = obj.Object("_bash_hash_table", offset = off - nbuckets_offset, vm = proc_as)
+            
+            if htable.is_valid():
+                bucket_array = obj.Object(theType="Array", targetType="Pointer", offset = htable.bucket_array, vm = htable.nbuckets.obj_vm, count = 64)
+       
+                for bucket_ptr in bucket_array:
+                    bucket = bucket_ptr.dereference_as("bucket_contents")
+                    while bucket.times_found > 0 and bucket.data.is_valid() and bucket.key.is_valid():  
+                        pdata = bucket.data 
+
+                        if pdata.path.is_valid() and (0 <= pdata.flags <= 2):
+                            yield bucket
+
+                        bucket = bucket.next
+        
+            off = off + 1
+
+    def ldrmodules(self):
+        proc_maps = {}
+        dl_maps   = {}
+        seen_starts = {}
+
+        proc_as = self.get_process_address_space()        
+
+        if not proc_as:
+            return
+
+        # get libraries from proc_maps
+        for vma in self.get_proc_maps():
+            sig = proc_as.read(vma.vm_start, 4)
+            
+            if sig == "\x7fELF":
+                flags = str(vma.vm_flags)
+       
+                if flags in ["rw-", "r--"]:
+                    continue 
+
+                fname = vma.vm_name(self)
+
+                if fname == "[vdso]":
+                    continue
+
+                start = vma.vm_start.v()
+
+                proc_maps[start]   = fname
+                seen_starts[start] = 1   
+
+        # get libraries from userland
+        for so in self.get_libdl_maps():
+            if so.l_addr == 0x0 or len(str(so.l_name)) == 0:
+                continue
+
+            start = so.l_addr.v()
+
+            dl_maps[start] = str(so.l_name)
+            seen_starts[start] = 1
+
+        for start in seen_starts:
+            vm_name = ""
+            
+            if start in proc_maps:    
+                pmaps = "True"
+                vm_name = proc_maps[start]
+            else:
+                pmaps = "False"
+
+            if start in dl_maps:
+                dmaps = "True"
+                
+                # we prefer the name from proc_maps as it is within kernel memory
+                if vm_name == "":
+                    vm_name = dl_maps[start]
+            else:
+                dmaps = "False"
+
+            yield (start, vm_name, pmaps, dmaps)
+
+    def plt_hook_info(self):
+        elfs = dict()
+
+        for elf, elf_start, elf_end, soname, needed in self.elfs():
+            elfs[(self, soname)] = (elf, elf_start, elf_end, needed)
+
+        for k, v in elfs.iteritems():
+            task, soname = k
+            elf, elf_start, elf_end, needed = v
+          
+            if elf._get_typename("hdr") == "elf32_hdr":
+                elf_arch = 32
+            else:
+                elf_arch = 64
+         
+            needed_expanded = set([soname])
+            if (task, None) in elfs:
+                needed_expanded.add(None)
+            # jmp slot can point to ELF itself if the fn hasn't been called yet (RTLD_LAZY)
+            # can point to main binary (None above) if this is a plugin-style symbol
+            while len(needed) > 0:
+                dep = needed.pop(0)
+                needed_expanded.add(dep)
+                try:
+                    needed += set(elfs[(task, dep)][3]) - needed_expanded
+                except KeyError:
+                    needed_expanded.remove(dep)
+
+            for reloc in elf.relocations():
+                rsym = elf.relocation_symbol(reloc)
+
+                if rsym == None:
+                    continue
+
+                symbol_name = elf.symbol_name(rsym)
+                if symbol_name == None:
+                    symbol_name = "<N/A>"
+
+                offset = reloc.r_offset
+               
+                if offset < elf_start:
+                    offset = elf_start + offset
+
+                if elf_arch == 32:
+                    addr = obj.Object("unsigned int", offset = offset, vm = elf.obj_vm)
+                else:
+                    addr = obj.Object("unsigned long long", offset = offset, vm = elf.obj_vm)
+                
+                match = False
+                for dep in needed_expanded:
+                    _, dep_start, dep_end, _ = elfs[(task, dep)]
+                    if addr >= dep_start and addr < dep_end:
+                        match = dep
+
+                hookdesc = ''
+                vma = None
+                for i in task.get_proc_maps():
+                    if addr >= i.vm_start and addr < i.vm_end:
+                        vma = i
+                        break                    
+                if vma:
+                    if vma.vm_file:
+                        hookdesc = linux_common.get_path(task, vma.vm_file)
+                    else:
+                        hookdesc = '[{0:x}:{1:x},{2}]'.format(vma.vm_start, vma.vm_end, vma.vm_flags)
+ 
+                if hookdesc == "":
+                        hookdesc = 'invalid memory'
+                
+                if match != False:
+                    if match == soname:
+                        hookdesc = '[RTLD_LAZY]'
+                    hooked = False 
+                
+                else:
+                    hooked = True
+
+                yield soname, elf, elf_start, elf_end, addr, symbol_name, hookdesc, hooked
+
+    def bash_history_entries(self):
+        proc_as = self.get_process_address_space()
+
+        if not proc_as:
+            return
+
+        # Keep a bucket of history objects so we can order them
+        history_entries = []
+
+        # Brute force the history list of an address isn't provided 
+        ts_offset = proc_as.profile.get_obj_offset("_hist_entry", "timestamp") 
+
+        # Are we dealing with 32 or 64-bit pointers
+        if proc_as.profile.metadata.get('memory_model', '32bit') == '32bit':
+            pack_format = "I"
+        else:
+            pack_format = "Q"
+
+        bang_addrs = []
+
+        # Look for strings that begin with pound/hash on the process heap 
+        for ptr_hash in self.search_process_memory(["#"], heap_only = True):
+            # Find pointers to this strings address, also on the heap 
+            bang_addrs.append(struct.pack(pack_format, ptr_hash))
+
+        for (idx, ptr_string) in enumerate(self.search_process_memory(bang_addrs, heap_only = True)):   
+            # Check if we found a valid history entry object 
+            hist = obj.Object("_hist_entry", 
+                              offset = ptr_string - ts_offset, 
+                              vm = proc_as)
+
+            if hist.is_valid():
+                history_entries.append(hist)
+                       
+        # Report everything we found in order
+        for hist in sorted(history_entries, key = attrgetter('time_as_integer')):
+            yield hist              
+
+    def psenv(self):
+        env = ""
+
+        if self.mm:
+            # set the as with our new dtb so we can read from userland
+            proc_as = self.get_process_address_space()
+
+            # read argv from userland
+            start = self.mm.env_start.v()
+
+            env = proc_as.read(start, self.mm.env_end - self.mm.env_start + 10)
+            
+        if env:
+            ents = env.split("\x00")
+            for varstr in ents:
+                eqidx = varstr.find("=")
+
+                if eqidx == -1:
+                    continue
+
+                key = varstr[:eqidx]
+                val = varstr[eqidx+1:]
+
+                yield (key, val) 
+
+    def bash_environment(self):
+        # Are we dealing with 32 or 64-bit pointers
+        if self.obj_vm.profile.metadata.get('memory_model', '32bit') == '32bit':
+            pack_format = "<I"
+            addr_sz = 4
+        else:
+            pack_format = "<Q"
+            addr_sz = 8
+
+        proc_as = self.get_process_address_space()
+        
+        # In cases when mm is an invalid pointer 
+        if not proc_as:
+            return
+
+        procvars = []
+        for vma in self.get_proc_maps():
+            if not (vma.vm_file and str(vma.vm_flags) == "rw-"):
+                continue
+
+            env_start = 0
+            for off in range(vma.vm_start, vma.vm_end):
+                # check the first index
+                addrstr = proc_as.read(off, addr_sz)
+                if not addrstr or len(addrstr) != addr_sz:
+                    continue
+                addr = struct.unpack(pack_format, addrstr)[0]
+                # check first idx...
+                if addr:
+                    firstaddrstr = proc_as.read(addr, addr_sz)
+                    if not firstaddrstr or len(firstaddrstr) != addr_sz:
+                        continue
+                    firstaddr = struct.unpack(pack_format, firstaddrstr)[0]
+                    buf = proc_as.read(firstaddr, 64)
+                    if not buf:
+                        continue
+                    eqidx = buf.find("=")
+                    if eqidx > 0:
+                        nullidx = buf.find("\x00")
+                        # single char name, =
+                        if nullidx >= eqidx:
+                            env_start = addr
+
+            if env_start == 0:
+                continue
+
+            envars = obj.Object(theType="Array", targetType="Pointer", vm=proc_as, offset=env_start, count=256)
+            for var in envars:
+                if var:
+                    sizes = [8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 4096]
+                    good_varstr = None
+
+                    for size in sizes:
+                        varstr = proc_as.read(var, size)
+                        if not varstr:
+                            continue
+
+                        eqidx = varstr.find("=")
+                        idx = varstr.find("\x00")
+
+                        if idx == -1 or eqidx == -1 or idx < eqidx:
+                            continue
+                    
+                        good_varstr = varstr
+                        break
+                
+                    if good_varstr:        
+                        good_varstr = good_varstr[:idx]
+
+                        key = good_varstr[:eqidx]
+                        val = good_varstr[eqidx+1:]
+
+                        yield (key, val) 
+                    else:
+                        break
+ 
+    def lsof(self):
+        fds = self.files.get_fds()
+        max_fds = self.files.get_max_fds()
+
+        fds = obj.Object(theType = 'Array', offset = fds.obj_offset, vm = self.obj_vm, targetType = 'Pointer', count = max_fds)
+
+        for i in range(max_fds):
+            if fds[i]:
+                filp = obj.Object('file', offset = fds[i], vm = self.obj_vm)
+                yield filp, i
+
+    # has to get the struct socket given an inode (see SOCKET_I in sock.h)
+    def SOCKET_I(self, inode):
+        # if too many of these, write a container_of
+        backsize = self.obj_vm.profile.get_obj_size("socket")
+        addr = inode - backsize
+
+        return obj.Object('socket', offset = addr, vm = self.obj_vm)
+
+    def netstat(self):
+        sfop = self.obj_vm.profile.get_symbol("socket_file_ops")
+        dfop = self.obj_vm.profile.get_symbol("sockfs_dentry_operations")
+        
+        for (filp, fdnum) in self.lsof(): 
+            if filp.f_op == sfop or filp.dentry.d_op == dfop:
+                iaddr = filp.dentry.d_inode
+                skt = self.SOCKET_I(iaddr)
+                inet_sock = obj.Object("inet_sock", offset = skt.sk, vm = self.obj_vm)
+
+                if inet_sock.protocol in ("TCP", "UDP", "IP", "HOPOPT"): #hopopt is where unix sockets end up on linux
+                    state = inet_sock.state if inet_sock.protocol == "TCP" else ""
+                    family = inet_sock.sk.__sk_common.skc_family #pylint: disable-msg=W0212
+
+                    if family == socket.AF_UNIX:
+                        unix_sock = obj.Object("unix_sock", offset = inet_sock.sk.v(), vm = self.obj_vm)
+
+                        if unix_sock.addr:
+                            name_obj = obj.Object("sockaddr_un", offset = unix_sock.addr.name.obj_offset, vm = self.obj_vm)
+                            name   = str(name_obj.sun_path)
+                        else:
+                            name = ""
+
+                        yield (socket.AF_UNIX, (name, iaddr.i_ino))
+
+                    elif family in (socket.AF_INET, socket.AF_INET6):
+                        sport = inet_sock.src_port 
+                        dport = inet_sock.dst_port 
+                        saddr = inet_sock.src_addr
+                        daddr = inet_sock.dst_addr
+
+                        yield (socket.AF_INET, (inet_sock, inet_sock.protocol, saddr, sport, daddr, dport, state)) 
+
     def get_process_address_space(self):
         ## If we've got a NoneObject, return it maintain the reason
+        if not self.mm:
+            return self.mm
+
         if self.mm.pgd.v() == None:
             return self.mm.pgd.v()
 
@@ -1037,6 +1521,15 @@ class task_struct(obj.CType):
 
             if found_list:
                 break
+
+    def threads(self):
+        thread_offset = self.obj_vm.profile.get_obj_offset("task_struct", "thread_group")
+        threads = [self]
+        x = obj.Object('task_struct', self.thread_group.next.v() - thread_offset, self.obj_vm)
+        while x not in threads:
+            threads.append(x)
+            x = obj.Object('task_struct', x.thread_group.next.v() - thread_offset, self.obj_vm)
+        return threads
 
     def get_proc_maps(self):
         if not self.mm:
@@ -1104,6 +1597,77 @@ class task_struct(obj.CType):
                     for hit in utils.iterfind(data, x):
                         yield offset + hit
                 offset += min(to_read, scan_blk_sz)
+
+    def elfs(self):
+        proc_as = self.get_process_address_space()
+
+        for vma in self.get_proc_maps():
+            elf = obj.Object("elf_hdr", offset = vma.vm_start, vm = proc_as) 
+
+            if not elf.is_valid():
+                continue
+
+            pt_loads = []
+            dt_soname = None
+            dt_strtab = None
+            dt_needed = []
+             
+            #### Walk pt_load and gather ranges
+            for phdr in elf.program_headers():
+                if not phdr.is_valid():
+                    continue                         
+               
+                if str(phdr.p_type) == 'PT_LOAD':
+                    pt_loads.append((phdr.p_vaddr, phdr.p_vaddr + phdr.p_memsz))
+
+                if str(phdr.p_type) != 'PT_DYNAMIC':
+                    continue                   
+             
+                for dsec in phdr.dynamic_sections():
+                    if dsec.d_tag == 5:
+                        dt_strtab = dsec.d_ptr
+
+                    elif dsec.d_tag == 14:
+                        dt_soname = dsec.d_ptr
+
+                    elif dsec.d_tag == 1:
+                        dt_needed.append(dsec.d_ptr)
+           
+                break
+                 
+            if dt_strtab == None or dt_needed == []:
+                continue
+
+            needed = []
+            for n_idx in dt_needed:
+                buf = proc_as.read(dt_strtab + n_idx, 256)
+                if buf:
+                    idx = buf.find("\x00")
+                    if idx != -1:
+                        buf = buf[:idx]
+
+                    if len(buf) > 0:
+                        needed.append(buf)
+            
+            soname = ""     
+            if dt_soname:
+                soname = proc_as.read(dt_strtab + dt_soname, 256)
+                if soname:
+                    idx = soname.find("\x00")
+                    if idx != -1:
+                        soname = soname[:idx]
+            
+            if not soname or len(soname) == 0:
+                soname = linux_common.get_path(self, vma.vm_file)
+
+            if pt_loads: 
+                (elf_start, elf_end) = (min(s[0] for s in pt_loads), max(s[1] for s in pt_loads))
+            else:
+                continue
+
+            # TODO - test diff without setting soname of vma
+            if soname or needed:
+                yield elf, elf_start, elf_end, soname, needed
 
     def ACTHZ(self, CLOCK_TICK_RATE, HZ):
         LATCH = ((CLOCK_TICK_RATE + HZ/2) / HZ)
@@ -1184,7 +1748,7 @@ class task_struct(obj.CType):
             data = struct.pack("<I", sec)
         except struct.error:
             # in case we exceed 0 <= number <= 4294967295
-            return ""
+            return 0
 
         bufferas = addrspace.BufferAddressSpace(self.obj_vm.get_config(), data = data)
         dt = obj.Object("UnixTimeStamp", offset = 0, vm = bufferas, is_utc = True)
@@ -1283,7 +1847,6 @@ class timespec(obj.CType):
         return time_obj
 
 class dentry(obj.CType):
-
     def get_partial_path(self):
         """ we can't get the full path b/c we 
         do not have a ref to the vfsmnt """
@@ -1302,14 +1865,30 @@ class dentry(obj.CType):
         str_path = "/".join([p for p in path])
         return str_path
 
+    @property
+    def d_count(self):
+        ret = self.members.get("d_count")
+        if ret is None:
+            ret = self.d_lockref.count
+        else:
+            ret = self.m("d_count")
+        return ret
+
 class VolatilityDTB(obj.VolatilityMagic):
     """A scanner for DTB values."""
 
     def generate_suggestions(self):
         """Tries to locate the DTB."""
-        shift = 0xc0000000
-        # this is the only code allowed to reference the internal sys_map!
-        yield self.obj_vm.profile.get_symbol("swapper_pg_dir") - shift
+        profile = self.obj_vm.profile
+        
+        if profile.metadata.get('memory_model', '32bit') == "32bit":
+            sym   = "swapper_pg_dir"
+            shift = 0xc0000000
+        else:
+            sym   = "init_level4_pgt"
+            shift = 0xffffffff80000000
+        
+        yield profile.get_symbol(sym) - shift
 
 # the intel check, simply checks for the static paging of init_task
 class VolatilityLinuxIntelValidAS(obj.VolatilityMagic):
@@ -1365,6 +1944,7 @@ class LinuxObjectClasses(obj.ProfileModification):
             'hlist_node': hlist_node,
             'files_struct': files_struct,
             'task_struct': task_struct,
+            'vm_area_struct': vm_area_struct,
             'module' : module_struct,
             'hlist_bl_node' : hlist_bl_node,
             'net_device' : net_device,

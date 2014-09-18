@@ -1,6 +1,6 @@
 # Volatility
 # Copyright (C) 2008-2013 Volatility Foundation
-# Copyright (C) 2011 Jamie Levy (Gleeda) <jamie.levy@gmail.com>
+# Copyright (C) 2011 Jamie Levy (Gleeda) <jamie@memoryanalysis.net>
 #
 # This file is part of Volatility.
 #
@@ -21,10 +21,11 @@
 """
 @author:       Jamie Levy (gleeda)
 @license:      GNU General Public License 2.0
-@contact:      jamie.levy@gmail.com
+@contact:      jamie@memoryanalysis.net
 @organization: Volatility Foundation
 """
 
+import volatility.utils as utils
 import volatility.plugins.getsids as getsids
 import volatility.plugins.registry.registryapi as registryapi
 import volatility.plugins.getservicesids as getservicesids
@@ -166,8 +167,6 @@ class EvtLogs(common.AbstractWindowsCommand):
                             data = process_space.zread(vad.Start, vad.Length)
                             yield name, data
 
-    def remove_unprintable(self, str):
-        return ''.join([c for c in str if (ord(c) > 31 or ord(c) == 9) and ord(c) <= 126])
 
     def parse_evt_info(self, name, buf, rawtime = False):
         
@@ -210,14 +209,14 @@ class EvtLogs(common.AbstractWindowsCommand):
             source = ""
 
             items = rec[rec_size:end].split("\x00\x00") 
-            source = self.remove_unprintable(items[0])
+            source = utils.remove_unprintable(items[0])
             if len(items) > 1:
-                computer_name = self.remove_unprintable(items[1])
+                computer_name = utils.remove_unprintable(items[1])
 
             strings = rec[evtlog.StringOffset:].split("\x00\x00", evtlog.NumStrings)
             messages = []
             for s in range(min(len(strings), evtlog.NumStrings)):
-                messages.append(self.remove_unprintable(strings[s]))
+                messages.append(utils.remove_unprintable(strings[s]))
                 
             # We'll just say N/A if there are no messages, otherwise join them
             # together with semi-colons.

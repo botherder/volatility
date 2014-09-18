@@ -31,14 +31,18 @@ import volatility.plugins.mac.pstasks as pstasks
 import volatility.plugins.mac.common as common
 
 class mac_adium(pstasks.mac_tasks):
-    """ Gets memory maps of processes """
+    """ Lists Adium messages """
 
     def __init__(self, config, *args, **kwargs):         
         pstasks.mac_tasks.__init__(self, config, *args, **kwargs)         
         self._config.add_option('DUMP-DIR', short_option = 'D', default = None, help = 'Output directory', action = 'store', type = 'str')
+        self._config.add_option('WIDE', short_option = 'W', default = False, help = 'Wide character search', action = 'store_true')
  
     def _make_uni(self, msg):
-        return "\x00".join([m for m in msg])
+        if self._config.WIDE:
+            return "\x00".join([m for m in msg])
+        else:
+            return msg
 
     def calculate(self):
         common.set_plugin_members(self)
@@ -46,6 +50,9 @@ class mac_adium(pstasks.mac_tasks):
         procs = pstasks.mac_tasks.calculate(self)
 
         for proc in procs:
+            if proc.p_comm.lower().find("adium") == -1:
+                continue
+            
             proc_as = proc.get_process_address_space()
 
             for map in proc.get_proc_maps():
@@ -56,31 +63,6 @@ class mac_adium(pstasks.mac_tasks):
 
                 if not buffer:
                     continue
-
-
-                '''
-
-                idx = 0
-
-                tmp_idx = buffer.find("<message ")
-
-                while tmp_idx != -1:
-                    idx = idx + tmp_idx
-
-                    end_idx = buffer[idx:].find("</message>")
-
-                    if end_idx != -1:
-                        msg = buffer[idx:idx + end_idx + 12]
-
-                        yield proc, map.start.v() + idx, msg
- 
-                    idx = idx + 5
-
-                    tmp_idx = buffer[idx:].find("<message ")
-
-                '''
-            
-
 
                 msg_search  = self._make_uni('<span class="x-message"')
                 time_search = self._make_uni('<span class="x-ltime"')
@@ -99,8 +81,6 @@ class mac_adium(pstasks.mac_tasks):
                        break
 
                     msg = buffer[idx: idx + msg_end_idx + 14]
-
-                    print "%x | %d | %d" % (map.start, msg_idx, msg_end_idx)
 
                     # to look for time and send
                     search_idx = idx - 200 
@@ -126,7 +106,6 @@ class mac_adium(pstasks.mac_tasks):
                         if send_end_idx != -1:
                             msg_sender = buffer[search_idx + send_idx: search_idx + send_idx  + send_end_idx + 14]
 
-                    print "%d | %d | %d = %d" % (len(msg_time), len(msg_sender), len(msg), len(msg_time) + len(msg_sender) + len(msg)) 
                     yield proc, map.start + idx, msg_time + msg_sender + msg                
                    
                     idx = idx + 5

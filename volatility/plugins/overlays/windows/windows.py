@@ -52,7 +52,6 @@ windows_overlay = {
     #hibrfil.sys values
     'HibrProcPage': [0x0, ['VolatilityMagic', dict(value = 0x0)]],
     'HibrEntryCount': [0x0, ['VolatilityMagic', dict(value = 0x0)]],
-    'MaxAddress': [0x0, ['VolatilityMaxAddress']],
     'MM_MAX_COMMIT': [ 0x0, ['VolatilityMagic', dict(value = 0x7ffffffffffff)]],
     'PolicyKey': [0x0, ['VolatilityMagic', dict(value = "PolSecretEncryptionKey")]],
     }],
@@ -106,7 +105,7 @@ windows_overlay = {
     'Signature' : [ None, ['String', dict(length = 2)]],
     'LastWriteTime' : [ None, ['WinTimeStamp', dict(is_utc = True)]],
     'Name' : [ None, ['String', dict(length = lambda x: x.NameLength)]],
-    'Parent': [ None, ['pointer', ['_CM_KEY_NODE']]],
+    'Parent': [ None, ['pointer32', ['_CM_KEY_NODE']]],
     }],
 
     '_CM_NAME_CONTROL_BLOCK' : [ None, {
@@ -114,7 +113,7 @@ windows_overlay = {
     }],
 
     '_CHILD_LIST' : [ None, {
-    'List' : [ None, ['pointer', ['array', lambda x: x.Count,
+    'List' : [ None, ['pointer32', ['array', lambda x: x.Count,
                                  ['pointer32', ['_CM_KEY_VALUE']]]]],
     }],
 
@@ -125,7 +124,7 @@ windows_overlay = {
 
     '_CM_KEY_INDEX' : [ None, {
     'Signature' : [ None, ['String', dict(length = 2)]],
-    'List' : [ None, ['array', lambda x: x.Count.v() * 2, ['pointer', ['_CM_KEY_NODE']]]],
+    'List' : [ None, ['array', lambda x: x.Count.v() * 2, ['pointer32', ['_CM_KEY_NODE']]]],
     }],
 
     'PO_MEMORY_IMAGE' : [ None, {
@@ -484,10 +483,14 @@ class _EPROCESS(obj.CType, ExecutiveObjectMixin):
         for vad in self.VadRoot.traverse():
             if not vad.is_valid():
                 continue
+
             # Skip Wow64 MM_MAX_COMMIT range
-            if (skip_max_commit and self.IsWow64 and vad.CommitCharge == max_commit and 
-                    vad.End > 0x7fffffff):
-                continue
+            if skip_max_commit: 
+                if self.IsWow64 and vad.CommitCharge == max_commit and vad.End > 0x7fffffff:
+                    continue
+                elif vad.Length > 0x7f000000000: # see issue #70
+                    continue
+
             # Apply the meta filter if one is supplied
             if vad_filter:
                 if not vad_filter(vad):
@@ -672,6 +675,9 @@ class _TOKEN(obj.CType):
                 default = luid.Attributes & 1 != 0
                 yield luid.Luid.LowPart, True, enabled, default
 
+class _OBJECT_TYPE(obj.CType, ExecutiveObjectMixin):
+    pass
+
 class _ETHREAD(obj.CType, ExecutiveObjectMixin):
     """ A class for threads """
 
@@ -843,7 +849,7 @@ class _OBJECT_HEADER(obj.CType):
         """Return the object's type as a string"""
         type_obj = obj.Object("_OBJECT_TYPE", self.Type, self.obj_native_vm)
 
-        return type_obj.Name.v()
+        return str(type_obj.Name or '')
 
     def is_valid(self):
         if not obj.CType.is_valid(self):
@@ -923,22 +929,6 @@ class VolatilityKPCR(obj.VolatilityMagic):
         scanner = kpcr.KPCRScanner()
         for val in scanner.scan(self.obj_vm):
             yield val
-
-class VolatilityMaxAddress(obj.VolatilityMagic):
-    """The maximum address of a profile's 
-    underlying AS. 
-
-    On x86 this is 0xFFFFFFFF (2 ** 32) - 1
-    On x64 this is 0xFFFFFFFFFFFFFFFF (2 ** 64) - 1 
-
-    We use a VolatilityMagic to calculate this 
-    based on the size of an address, since that's 
-    something we can already rely on being set
-    properly for the AS. 
-    """
-
-    def generate_suggestions(self):
-        yield 2 ** (self.obj_vm.profile.get_obj_size("address") * 8) - 1
 
 class VolatilityKDBG(obj.VolatilityMagic):
     """A Scanner for KDBG data within an address space"""
@@ -1112,7 +1102,9 @@ class _POOL_HEADER(obj.CType):
             if (header.is_valid() and 
                         header.get_object_type() == object_type):
 
-                return header.dereference_as(object_name)
+                the_object = header.dereference_as(object_name)
+                if the_object.is_valid():
+                    return the_object
 
         return obj.NoneObject("Cannot find object")
 
@@ -1186,13 +1178,13 @@ class WindowsObjectClasses(obj.ProfileModification):
             'VolatilityKDBG': VolatilityKDBG,
             'VolatilityIA32ValidAS': VolatilityIA32ValidAS,
             'VolatilityAMD64ValidAS': VolatilityAMD64ValidAS,
-            'VolatilityMaxAddress': VolatilityMaxAddress,
             '_CM_KEY_BODY': _CM_KEY_BODY,
             '_TOKEN': _TOKEN,
             '_POOL_HEADER': _POOL_HEADER,
             '_OBJECT_SYMBOLIC_LINK': _OBJECT_SYMBOLIC_LINK,
             '_KMUTANT': _KMUTANT,
             '_CMHIVE': _CMHIVE,
+            '_OBJECT_TYPE': _OBJECT_TYPE,
             })
 
 class VolMagicPoolTag(obj.VolatilityMagic):
@@ -1252,6 +1244,7 @@ class PoolTagModification(obj.ProfileModification):
             'FilePoolTag': [ 0x0, ['VolMagicPoolTag', dict(tag = "File", protected = protected)]],
             'WindPoolTag': [ 0x0, ['VolMagicPoolTag', dict(tag = "Wind", protected = protected)]],
             'ThreadPoolTag': [ 0x0, ['VolMagicPoolTag', dict(tag = "Thre", protected = protected)]],
+            'ObjectTypePoolTag': [ 0x0, ['VolMagicPoolTag', dict(tag = "ObjT", protected = protected)]],
             }]})
 
 class AbstractKDBGMod(obj.ProfileModification):

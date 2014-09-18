@@ -1,6 +1,6 @@
 # Volatility
 # Copyright (C) 2008-2013 Volatility Foundation
-# Copyright (C) 2011 Jamie Levy (Gleeda) <jamie.levy@gmail.com>
+# Copyright (C) 2011 Jamie Levy (Gleeda) <jamie@memoryanalysis.net>
 #
 # This file is part of Volatility.
 #
@@ -21,10 +21,11 @@
 """
 @author:       Jamie Levy (Gleeda)
 @license:      GNU General Public License 2.0
-@contact:      jamie.levy@gmail.com
+@contact:      jamie@memoryanalysis.net
 @organization: Volatility Foundation
 """
 
+import volatility.utils as utils
 import volatility.win32.hive as hivemod
 import volatility.win32.rawreg as rawreg
 import volatility.win32.hashdump as hashdump
@@ -43,8 +44,6 @@ class RegistryApi(object):
         self.current_offsets = {}
         self.populate_offsets()
 
-    def remove_unprintable(self, str):
-        return ''.join([c for c in str if (ord(c) > 31 or ord(c) == 9) and ord(c) <= 126])
 
     def print_offsets(self):
         '''
@@ -63,14 +62,9 @@ class RegistryApi(object):
         hiveroot = hl.HiveList(self._config).calculate()
 
         for hive in hiveroot:
-            if hive.obj_offset not in hive_offsets:
+            if hive.is_valid() and hive.obj_offset not in hive_offsets:
                 hive_offsets.append(hive.obj_offset)
-                try:
-                    name = hive.FileFullPath.v() or hive.FileUserName.v() or hive.HiveRootPath.v() or "[no name]"
-                # What exception are we expecting here?
-                except:
-                    name = "[no name]"
-                self.all_offsets[hive.obj_offset] = name
+                self.all_offsets[hive.obj_offset] = hive.get_name()
 
     def reg_get_currentcontrolset(self, fullname = True):
         '''
@@ -148,9 +142,9 @@ class RegistryApi(object):
         Takes in a key object and traverses back through its family to build the path
         '''
         path = key.Name
-        while key.Parent:
+        while key.Parent and key.Parent & 0xffffffff > 0x20:
             key = key.Parent.dereference()
-            if self.remove_unprintable(str(key.Name)) != "": 
+            if utils.remove_unprintable(str(key.Name)) != "": 
                 path = "{0}\\{1}".format(key.Name, path)
         return path
 
@@ -190,23 +184,27 @@ class RegistryApi(object):
         '''
         This function enumerates the subkeys of the requested key
         '''
-        k = given_root if given_root != None else self.reg_get_key(hive_name, key)
-        if k:
-            for s in rawreg.subkeys(k):
-                if s.Name:
-                    yield s
+        if key or given_root:
+            k = given_root if given_root != None else self.reg_get_key(hive_name, key)
+            if k:
+                for s in rawreg.subkeys(k):
+                    if s.Name:
+                        yield s
 
-    def reg_yield_values(self, hive_name, key, thetype = None, given_root = None):
+    def reg_yield_values(self, hive_name, key, thetype = None, given_root = None, raw = False):
         '''
         This function yields all values for a  requested registry key
         '''
-        if key:
+        if key or given_root:
             h = given_root if given_root != None else self.reg_get_key(hive_name, key)
             if h != None:
                 for v in rawreg.values(h):
                     tp, dat = rawreg.value_data(v)
                     if thetype == None or tp == thetype:
-                        yield v.Name, dat 
+                        if raw:
+                            yield v, dat
+                        else:
+                            yield v.Name, dat 
 
     def reg_get_value(self, hive_name, key, value, strcmp = None, given_root = None):
         '''

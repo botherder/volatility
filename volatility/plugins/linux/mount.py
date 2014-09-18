@@ -33,9 +33,12 @@ class linux_mount(linux_common.AbstractLinuxCommand):
     """Gather mounted fs/devices"""
 
     def _parse_mnt(self, mnt, ns, fs_types):
-        dev_name = mnt.mnt_devname.dereference_as("String", length = linux_common.MAX_STRING_LENGTH)
+        if not mnt.mnt_root.is_valid():
+            return
 
-        if not dev_name.is_valid() or len(dev_name) < 2:
+        dev_name = mnt.mnt_devname.dereference_as("String", length = linux_common.MAX_STRING_LENGTH)
+       
+        if not dev_name.is_valid():
             return
 
         fstype = mnt.mnt_sb.s_type.name.dereference_as("String", length = linux_common.MAX_STRING_LENGTH)
@@ -62,37 +65,52 @@ class linux_mount(linux_common.AbstractLinuxCommand):
 
     def calculate(self):
         linux_common.set_plugin_members(self)
-        mntptr = obj.Object("Pointer", offset = self.addr_space.profile.get_symbol("mount_hashtable"), vm = self.addr_space)
-
-        mnt_list = obj.Object(theType = "Array", offset = mntptr.v(), vm = self.addr_space, targetType = "list_head", count = 512)
+        mntptr   = obj.Object("Pointer", offset = self.addr_space.profile.get_symbol("mount_hashtable"), vm = self.addr_space)
+        mnt_list = obj.Object(theType = "Array", offset = mntptr, vm = self.addr_space, targetType = "list_head", count = 8200)
 
         if self.profile.has_type("mount"):
             mnttype = "mount"
-
-            for task in linux_pslist.linux_pslist(self._config).calculate():
-                if task.pid == 1:
-                    ns = task.nsproxy.mnt_ns
-                    break
-
         else:
             mnttype = "vfsmount"
-            ns = None
 
+        ns = None        
         fs_types = self._get_filesystem_types()
 
-        seen = {}
-
-        # get each list_head out of the array
+        hash_mnts = {}
         for outerlist in mnt_list:
-
             if outerlist == outerlist.next:
                 continue
 
             for mnt in outerlist.list_of_type(mnttype, "mnt_hash"):
+                hash_mnts[mnt]            = 1
+                hash_mnts[mnt.mnt_parent] = 1
+                hash_mnts[mnt.mnt_parent.mnt_parent] = 1
+
+        child_mnts = {}
+        for mnt in hash_mnts:
+            for child_mnt in mnt.mnt_child.list_of_type(mnttype, "mnt_child"):
+                child_mnts[child_mnt]            = 1
+                child_mnts[child_mnt.mnt_parent] = 1
+                child_mnts[child_mnt.mnt_parent.mnt_parent] = 1
+        
+        all_mnts = list(set(hash_mnts.keys() + child_mnts.keys()))
+    
+        list_mnts = {}
+        for mnt in all_mnts:
+            for child_mnt in mnt.mnt_list.list_of_type(mnttype, "mnt_list"):
+                list_mnts[child_mnt]            = 1
+                list_mnts[child_mnt.mnt_parent] = 1
+                list_mnts[child_mnt.mnt_parent.mnt_parent] = 1
+       
+        all_mnts = list(set(all_mnts + list_mnts.keys()))
+ 
+        seen = {}
+        for (idx, mnt) in enumerate(all_mnts):
+            if mnt.mnt_sb.v() not in seen:
                 for (mnt_sb, dev_name, path, fstype, rr, mnt_string) in self._parse_mnt(mnt, ns, fs_types):
-                    if mnt_sb.v() not in seen:
-                        yield (mnt_sb, dev_name, path, fstype, rr, mnt_string)
-                        seen[mnt_sb.v()] = 1
+                    yield (mnt_sb, dev_name, path, fstype, rr, mnt_string)
+            
+            seen[mnt.mnt_sb.v()] = 1
 
     def _calc_mnt_string(self, mnt):
         ret = ""

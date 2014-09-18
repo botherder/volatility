@@ -112,6 +112,17 @@ elf32_vtypes = {
         'st_other'  : [ 13, ['unsigned char']],
         'st_shndx'  : [ 14,  ['unsigned short']],
     }],
+
+    'elf32_rel' : [ 8, {
+        'r_offset' : [ 0,  ['unsigned int']],
+        'r_info'   : [ 4,  ['unsigned int']],
+    }],
+
+    'elf32_rela' : [ 12, {
+        'r_offset' : [ 0,  ['unsigned int']],
+        'r_info'   : [ 4,  ['unsigned int']],
+        'r_addend' : [ 8,  ['int']],
+     }],
 }
 
 elf64_vtypes = {
@@ -198,13 +209,24 @@ elf64_vtypes = {
         'st_size'  : [ 16, ['unsigned long long']],
     }],
 
-   'elf64_link_map' : [0, {
+    'elf64_link_map' : [0, {
         'l_addr' : [0, ['unsigned long long']], 
         'l_name' : [8, ['unsigned long long']], 
         'l_ld'   : [16, ['unsigned long long']], 
         'l_next' : [24, ['unsigned long long']], 
         'l_prev' : [32, ['unsigned long long']], 
-        }],
+    }],
+   
+    'elf64_rel' : [ 16, {
+        'r_offset' : [ 0,  ['unsigned long long']],
+        'r_info'   : [ 8,  ['unsigned long long']],
+    }],
+
+    'elf64_rela' : [ 24, {
+        'r_offset' : [ 0,  ['unsigned long long']],
+        'r_info'   : [ 8,  ['unsigned long long']],
+        'r_addend' : [ 16,  ['long long']],
+    }],
 }
 
 class elf(obj.CType):
@@ -223,12 +245,9 @@ class elf(obj.CType):
     def is_valid(self):
         return self.size_cache in [32, 64, -39]
 
-    def _init_cache(self, offset, vm):
-        self._set_size_cache(offset, vm)
-        self._make_elf_obj(offset, vm) 
-
     def _init_cache_from_parent(self):
         self.size_cache = self.obj_parent.size_cache
+        
         self._make_elf_obj(self.obj_offset, self.obj_vm)
 
     def _make_elf_obj(self, offset, vm):
@@ -238,7 +257,7 @@ class elf(obj.CType):
             self.elf_obj = obj.Object(self.name64, offset = offset, vm = vm)
         else:
             self.elf_obj = None
-
+        
     def _set_size_cache(self, offset, vm):
         ei_class = obj.Object("unsigned char", offset = offset + 4, vm = vm)
         if ei_class == 1:
@@ -247,6 +266,10 @@ class elf(obj.CType):
             self.size_cache = 64
         else:
             self.size_cache = -42
+
+    def _init_cache(self, offset, vm):
+        self._set_size_cache(offset, vm)
+        self._make_elf_obj(offset, vm) 
 
     def _get_typename(self, typename):
         if self.size_cache == -39:
@@ -275,6 +298,9 @@ class elf_hdr(elf):
         self.cached_numsyms = 0
 
         elf.__init__(self, 1, "elf32_hdr", "elf64_hdr", theType, offset, vm, name, **kwargs)    
+
+    def is_valid(self):
+        return self.elf_obj != None
         
     def program_headers(self):
         rtname = self._get_typename("phdr")
@@ -290,14 +316,15 @@ class elf_hdr(elf):
             idx = i * rtsize
 
             phdr = obj.Object("elf_phdr", offset = arr_start + idx, vm = self.obj_vm, parent = self)
-            yield phdr  
+            if phdr.is_valid():
+                yield phdr  
 
     def _section_headers(self):
         rtname = self._get_typename("shdr")
         rtsize = self.obj_vm.profile.get_obj_size(rtname)
 
         tname = "elf_shdr"
-        
+       
         # the buffer of headers
         arr_start = self.obj_offset + self.e_shoff
 
@@ -316,77 +343,135 @@ class elf_hdr(elf):
             idx = i * rtsize
 
             shdr = obj.Object("elf_shdr", offset = arr_start + idx, vm = self.obj_vm, parent = self)
-            yield shdr  
+            if shdr.is_valid():
+                yield shdr  
 
-    def _find_symbols(self):
-        shstr = self.section_header(self.e_shstrndx)
-        shstr_strs = shstr.sh_offset
+    def _find_symbols_program_headers(self):
+        for phdr in self.program_headers():
+            if not phdr.is_valid() or str(phdr.p_type) != 'PT_DYNAMIC':
+                continue                   
+    
+            dt_strtab = None
+            dt_symtab = None    
+            dt_strent = None
 
-        sstrtab = None
-        ssymtab = None
-        dsymtab = None
-        dstrtab = None
+            for dsec in phdr.dynamic_sections():
+                if dsec.d_tag == 5:
+                    dt_strtab = dsec.d_ptr
 
-        # find the most useful symtab/strtab combo
-        for sect in self.section_headers():          
-            sectname_addr = self.obj_offset + shstr_strs + sect.sh_name
+                elif dsec.d_tag == 6:
+                    dt_symtab = dsec.d_ptr
+
+                elif dsec.d_tag == 11:
+                    dt_strent = dsec.d_ptr
+
+            if dt_strtab == None or dt_symtab == None or dt_strent == None:
+                return None
             
-            sectname = self.obj_vm.read(sectname_addr, 64)
-            idx = sectname.find("\x00")
-            if idx != -1:   
-                sectname = sectname[:idx]
+            break
 
-            if sectname == ".strtab":
-                sstrtab = self.obj_offset + sect.sh_offset
-            elif sectname == ".symtab":
-                ssymtab = self.obj_offset + sect.sh_offset
-                sents   = sect.sh_size / sect.sh_entsize
-            elif sectname == ".dynsym":
-                dsymtab = sect.sh_addr
-                dents   = sect.sh_size / sect.sh_entsize            
-            elif sectname == ".dynstr":            
-                dstrtab = sect.sh_addr
+        self.cached_symtab  = dt_symtab
+        self.cached_strtab  = dt_strtab
 
-        # we prefer the static table as it has more info
-        # but it is deleted in stripped binaries (very common)
-        if sstrtab and ssymtab:
-            strtab = sstrtab
-            symtab = ssymtab
-            numsyms = sents
-
-        elif dsymtab and dstrtab:
-            strtab = dstrtab
-            symtab = dsymtab
-            numsyms = dents           
- 
+        if dt_symtab.v() < dt_strtab.v():
+            self.cached_numsyms = (dt_strtab.v() - dt_symtab.v()) / dt_strent 
         else:
-            return
-
-        self.cached_symtab = symtab
-        self.cached_strtab = strtab
-        self.cached_numsyms = numsyms
+            self.cached_numsyms = 1024
+    
+    def _find_symbols(self):
+        self._find_symbols_program_headers()
 
     def symbols(self):
-        self._find_symbols()
+        if self.cached_symtab == None:
+            self._find_symbols()
+                
+        if self.cached_symtab == None:
+            return
 
         rtname = self._get_typename("sym")
-
-        #print "symtab: %x numsyms: %d strtab: %x" % (symtab, numsyms, strtab)
 
         symtab_arr = obj.Object(theType="Array", targetType=rtname, count=self.cached_numsyms, offset = self.cached_symtab, vm = self.obj_vm) 
         for sym in symtab_arr:
             yield sym
 
+    def symbol_at(self, sym_idx):
+        ret = None
+
+        for (cur_idx, sym) in enumerate(self.symbols()):
+            if cur_idx == sym_idx:
+                ret = sym
+                break
+
+        return ret            
+
     def symbol_name(self, sym):
         addr = self.cached_strtab + sym.st_name
         name = self.obj_vm.read(addr, 255)
-        idx = name.find("\x00")
-        name = name[:idx]
+        if name:
+            idx = name.find("\x00")
+            if idx != -1:
+                name = name[:idx]
+        else:
+            name = "N/A"
         return name
 
+    def relocation_symbol(self, reloc):
+        ridx = reloc.relocation_symbol_index()
+        sym = self.symbol_at(ridx)
+        return sym
+
+    def relocations(self):
+        for phdr in self.program_headers():
+            if str(phdr.p_type) != 'PT_DYNAMIC':
+                continue
+            
+            dt_jmprel   = None
+            dt_pltrelsz = None
+            dt_pltrel   = None
+
+            for dsec in phdr.dynamic_sections():
+                if dsec.d_tag == 23:
+                    dt_jmprel = dsec.d_ptr
+
+                elif dsec.d_tag == 2:
+                    dt_pltrelsz = dsec.d_ptr
+
+                elif dsec.d_tag == 20:
+                    dt_pltrel = dsec.d_ptr                  
+
+            if dt_jmprel == None or dt_pltrelsz == None or dt_pltrel == None:
+                print "needed info missing"
+                return
+
+            if dt_pltrel == 7:
+                struct_name = "elf_rela"
+                if self.size_cache == 32:
+                    struct_size = 12                       
+                else:
+                    struct_size = 24
+
+            elif dt_pltrel == 17:
+                struct_name = "elf_rel"
+                if self.size_cache == 32:
+                    struct_size = 8          
+                else:
+                    struct_size = 16
+            else:   
+                print "unknown relocation type: %d" % dt_pltrel
+
+            # arr = obj.Object(theType="Array", targetType=struct_name, parent = self, count = dt_pltrelsz / struct_size, offset = dt_jmprel, vm = self.obj_vm)
+
+
+            count = dt_pltrelsz / struct_size
+            
+            for idx in range(count + 24):
+                offset = dt_jmprel + (idx * struct_size)
+
+                reloc = obj.Object(struct_name, offset = offset, vm = self.obj_vm, parent = self)              
+                    
+                yield reloc 
 
 class elf_shdr(elf):
-
     """ An elf section header """
 
     def __init__(self, theType, offset, vm, name = None, **kwargs):
@@ -400,11 +485,85 @@ class elf64_shdr(obj.CType):
     def __init__(self, theType, offset, vm, name = None, **kwargs):
         obj.CType.__init__(self, theType, offset, vm, name, **kwargs)
 
+class elf_rel(elf):
+    """ An elf relocation """
+
+    def __init__(self, theType, offset, vm, name = None, **kwargs):
+        elf.__init__(self, 0, "elf32_rel", "elf64_rel", theType, offset, vm, name, **kwargs)    
+
+    def relocation_type(self):
+        t = self._get_typename("rel")
+        if t == "elf32_rel":
+            ret = self.r_info & 0xff
+        else:
+            ret = self.r_info & 0xffffffff
+
+        return ret
+
+    def relocation_symbol_index(self):
+        t = self._get_typename("rel")
+        if t == "elf32_rel":
+            ret = self.r_info >> 8
+        else:
+            ret = self.r_info >> 32
+   
+        return ret
+
+class elf32_rel(obj.CType):
+    def __init__(self, theType, offset, vm, name = None, **kwargs):
+        obj.CType.__init__(self, theType, offset, vm, name, **kwargs)
+
+class elf64_rel(obj.CType):
+    def __init__(self, theType, offset, vm, name = None, **kwargs):
+        obj.CType.__init__(self, theType, offset, vm, name, **kwargs)
+
+class elf_rela(elf):
+    """ An elf relocation """
+
+    def __init__(self, theType, offset, vm, name = None, **kwargs):
+        elf.__init__(self, 0, "elf32_rela", "elf64_rela", theType, offset, vm, name, **kwargs)    
+
+    def relocation_type(self):
+        t = self._get_typename("rel")
+        if t == "elf32_rel":
+            ret = self.r_info & 0xff
+        else:
+            ret = self.r_info & 0xffffffff
+
+        return ret
+
+    def relocation_symbol_index(self):
+        t = self._get_typename("rel")
+        if t == "elf32_rel":    
+            ret = self.r_info >> 8
+        else:
+            ret = self.r_info >> 32
+    
+        return ret
+
+
+class elf32_rela(obj.CType):
+    def __init__(self, theType, offset, vm, name = None, **kwargs):
+        obj.CType.__init__(self, theType, offset, vm, name, **kwargs)
+
+class elf64_rela(obj.CType):
+    def __init__(self, theType, offset, vm, name = None, **kwargs):
+        obj.CType.__init__(self, theType, offset, vm, name, **kwargs)
+
 class elf_phdr(elf):
     """ An elf program header """
 
     def __init__(self, theType, offset, vm, name = None, **kwargs):
         elf.__init__(self, 0, "elf32_phdr", "elf64_phdr", theType, offset, vm, name, **kwargs)    
+
+    @property
+    def p_vaddr(self):
+        ret = self.__getattr__("p_vaddr")
+
+        if self.obj_parent.e_type == 3: # ET_DYN
+            ret = self.obj_parent.obj_offset + ret
+
+        return ret
 
     def dynamic_sections(self):
         # sanity check
@@ -418,7 +577,7 @@ class elf_phdr(elf):
         tname = "elf_dyn"
         
         # the buffer of array starts at elf_base + our virtual address ( offset )
-        arr_start = self.obj_parent.obj_offset + self.p_vaddr
+        arr_start = self.p_vaddr
 
         for i in range(256):
             # use the real size
@@ -565,7 +724,13 @@ class ELFModification(obj.ProfileModification):
                     'elf_link_map'   : elf_link_map,
                     'elf32_link_map' : elf32_link_map,
                     'elf64_link_map' : elf64_link_map,
-                      })
+                    'elf_rel'    : elf_rel, 
+                    'elf32_rel'  : elf32_rel, 
+                    'elf64_rel'  : elf64_rel,
+                    'elf_rela'   : elf_rela,
+                    'elf32_rela' : elf32_rela,
+                    'elf64_rela' : elf64_rela 
+                     })
 
 class ELF64Modification(obj.ProfileModification):
     def modification(self, profile):

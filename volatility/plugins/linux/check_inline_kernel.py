@@ -32,7 +32,7 @@ import volatility.plugins.linux.lsmod  as linux_lsmod
 
 
 ### TODO: merge with check_fops
-import volatility.plugins.linux.lsof as linux_lsof
+import volatility.plugins.linux.pslist as linux_pslist
 from volatility.plugins.linux.slab_info import linux_slabinfo
 import volatility.plugins.linux.find_file as find_file
 
@@ -135,12 +135,13 @@ class linux_check_inline_kernel(linux_common.AbstractLinuxCommand):
 
     def check_open_files_fop(self, f_op_members, modules):
         # get all the members in file_operations, they are all function pointers
-        openfiles = linux_lsof.linux_lsof(self._config).calculate()
+        tasks = linux_pslist.linux_pslist(self._config).calculate()
 
-        for (task, filp, i) in openfiles:
-            for (hooked_member, hook_type, hook_address) in self._is_inline_hooked(filp.f_op, f_op_members, modules):
-                name = "{0:s} {1:d} {2:s}".format(task.comm, i, linux_common.get_path(task, filp))
-                yield (name, hooked_member, hook_type, hook_address)
+        for task in tasks: 
+            for filp, i in task.lsof():
+                for (hooked_member, hook_type, hook_address) in self._is_inline_hooked(filp.f_op, f_op_members, modules):
+                    name = "{0:s} {1:d} {2:s}".format(task.comm, i, linux_common.get_path(task, filp))
+                    yield (name, hooked_member, hook_type, hook_address)
 
     def check_proc_fop(self, f_op_members, modules):
 
@@ -276,10 +277,11 @@ class linux_check_inline_kernel(linux_common.AbstractLinuxCommand):
         for func_name in known_funcs:
             func_addr = self.profile.get_symbol(func_name)
 
-            hook_info = self._is_hooked(func_addr,  modules)
-            if hook_info:
-                (hook_type, hook_address) = hook_info
-                yield (func_name, "", hook_type, hook_address)        
+            if func_addr:
+                hook_info = self._is_hooked(func_addr,  modules)
+                if hook_info:
+                    (hook_type, hook_address) = hook_info
+                    yield (func_name, "", hook_type, hook_address)        
 
     def calculate(self):
         linux_common.set_plugin_members(self)
@@ -289,11 +291,11 @@ class linux_check_inline_kernel(linux_common.AbstractLinuxCommand):
 
         modules  = linux_lsmod.linux_lsmod(self._config).get_modules()       
  
-        funcs = [self._check_file_op_pointers, self._check_afinfo, self._check_inetsw]
+        funcs = [self._check_known_functions, self._check_file_op_pointers, self._check_afinfo, self._check_inetsw]
         
         for func in funcs:
-            for hook_info in func(modules):
-                yield hook_info
+            for (sym_name, member, hook_type, sym_addr) in func(modules):
+                yield (sym_name, member, hook_type, sym_addr)
 
     def render_text(self, outfd, data):
 

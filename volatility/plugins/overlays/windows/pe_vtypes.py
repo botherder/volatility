@@ -451,6 +451,10 @@ class _LDR_DATA_TABLE_ENTRY(obj.CType):
         """Return the IMAGE_DEBUG_DIRECTORY for debug info"""
         return self._directory(6) # IMAGE_DEBUG_DIRECTORY
 
+    def security_dir(self):
+        """Return the IMAGE_SECURITY_DIRECTORY"""
+        return self._directory(4) # IMAGE_DIRECTORY_ENTRY_SECURITY
+
     def get_debug_directory(self):
         """Return the debug directory object for this PE"""
         
@@ -581,24 +585,15 @@ class _IMAGE_DOS_HEADER(obj.CType):
         full_blocks = ((data_size + (data_start % 0x1000)) / 0x1000) - 1
         left_over = (data_size + data_start) % 0x1000
 
-        paddr = self.obj_vm.vtop(data_start)
         code = ""
 
         # Deal with reads that are smaller than a block
         if data_size < first_block:
             data_read = self.obj_vm.zread(data_start, data_size)
-            if paddr == None:
-                pass
-                #if self._config.verbose:
-                #    debug.debug("Memory Not Accessible: Virtual Address: 0x{0:x} File Offset: 0x{1:x} Size: 0x{2:x}\n".format(data_start, offset, data_size))
             code += data_read
             return (offset, code)
 
         data_read = self.obj_vm.zread(data_start, first_block)
-        if paddr == None:
-            pass
-            #if self._config.verbose:
-            #    debug.debug("Memory Not Accessible: Virtual Address: 0x{0:x} File Offset: 0x{1:x} Size: 0x{2:x}\n".format(data_start, offset, first_block))
         code += data_read
 
         # The middle part of the read
@@ -606,20 +601,12 @@ class _IMAGE_DOS_HEADER(obj.CType):
 
         for _i in range(0, full_blocks):
             data_read = self.obj_vm.zread(new_vaddr, 0x1000)
-            if self.obj_vm.vtop(new_vaddr) == None:
-                pass
-                #if self._config.verbose:
-                #    debug.debug("Memory Not Accessible: Virtual Address: 0x{0:x} File Offset: 0x{1:x} Size: 0x{2:x}\n".format(new_vaddr, offset, 0x1000))
             code += data_read
             new_vaddr = new_vaddr + 0x1000
 
         # The last part of the read
         if left_over > 0:
             data_read = self.obj_vm.zread(new_vaddr, left_over)
-            if self.obj_vm.vtop(new_vaddr) == None:
-                pass
-                #if self._config.verbose:
-                #    debug.debug("Memory Not Accessible: Virtual Address: 0x{0:x} File Offset: 0x{1:x} Size: 0x{2:x}\n".format(new_vaddr, offset, left_over))
             code += data_read
         return (offset, code)
 
@@ -632,11 +619,13 @@ class _IMAGE_DOS_HEADER(obj.CType):
                 return (addr + (align - (addr % align)))
             return (addr - (addr % align))
 
-    def _get_image_exe(self, unsafe):
+    def _get_image_exe(self, unsafe, fix):
     
         nt_header = self.get_nt_header()
         soh = nt_header.OptionalHeader.SizeOfHeaders
         header = self.obj_vm.zread(self.obj_offset, soh)
+        if fix:
+            header = self._fix_header_image_base(header, nt_header)
         yield (0, header)
 
         fa = nt_header.OptionalHeader.FileAlignment
@@ -657,14 +646,29 @@ class _IMAGE_DOS_HEADER(obj.CType):
         result = header[:start] + newval + header[end:]
         return result
 
-    def _get_image_mem(self, unsafe):
+    def _fix_header_image_base(self, header, nt_header):
+        """
+        returns a modified header buffer with the image base changed to the
+        provided base address
+        """        
+
+        imb_offs = nt_header.OptionalHeader.ImageBase.obj_offset - self.obj_offset      
+        imb = nt_header.OptionalHeader.ImageBase
+        newval = struct.pack(imb.format_string, int(self.obj_offset))
+        return header[:imb_offs] + newval + header[imb_offs+imb.size():]
+
+    def _get_image_mem(self, unsafe, fix):
 
         nt_header = self.get_nt_header()
 
         sa = nt_header.OptionalHeader.SectionAlignment
         shs = self.obj_vm.profile.get_obj_size('_IMAGE_SECTION_HEADER')
 
-        yield self.get_code(self.obj_offset, nt_header.OptionalHeader.SizeOfImage, 0)
+        offset, data = self.get_code(self.obj_offset, nt_header.OptionalHeader.SizeOfImage, 0)
+        if fix:
+            data = self._fix_header_image_base(data, nt_header)
+
+        yield offset, data
 
         prevsect = None
         sect_sizes = []
@@ -687,12 +691,12 @@ class _IMAGE_DOS_HEADER(obj.CType):
             yield (start_addr + (counter * shs), sectheader)
             counter += 1
 
-    def get_image(self, unsafe = False, memory = False):
+    def get_image(self, unsafe = False, memory = False, fix = False):
 
         if memory:
-            return self._get_image_mem(unsafe)
+            return self._get_image_mem(unsafe, fix)
         else:
-            return self._get_image_exe(unsafe)
+            return self._get_image_exe(unsafe, fix)
 
 class _IMAGE_NT_HEADERS(obj.CType):
     """PE header"""
@@ -771,11 +775,31 @@ class VerStruct(obj.CType):
             offset = self.offset_pad(offset + item.Length)
         raise StopIteration("No children")
 
+    def display_unicode(self, string):
+        """Renders a UTF16 string"""
+        if string is None:
+            return ''
+        return string.decode("utf16", "ignore").encode("ascii", 'backslashreplace')
+
+    def get_file_strings(self):
+
+        for name, children in self.get_children():
+            if name == 'StringFileInfo':
+                for _codepage, strings in children:
+                    for string, value in strings:
+                        # Make sure value isn't a generator, and we've a subtree to deal with
+                        if isinstance(value, type(strings)):
+                            debug.debug("  {0} : Subtrees not yet implemented\n".format(string))
+                        else:
+                            yield string, self.display_unicode(value)
+
 class _VS_VERSION_INFO(VerStruct):
     """Version Information"""
 
     def get_children(self):
         """Recurses through the children of a Version Info records"""
+        if not self.FileInfo:
+            raise StopIteration("No children")
         offset = self.offset_pad(self.FileInfo.obj_offset + self.ValueLength)
         return self._recurse_children(offset)
 

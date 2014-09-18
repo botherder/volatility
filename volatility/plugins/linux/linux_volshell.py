@@ -36,7 +36,7 @@ class linux_volshell(volshell.volshell):
             print "{0:24} {1:d}".format(module.name, module.init_size + module.core_size)
 
     def getpidlist(self):
-        return pslist.linux_pslist(self._config).calculate()
+        return pslist.linux_pslist(self._config).allprocs()
 
     def ps(self, procs = None):
         print "{0:16} {1:6} {2:8}".format("Name", "PID", "Offset")
@@ -48,8 +48,10 @@ class linux_volshell(volshell.volshell):
         print "Current context: process {0}, pid={1} DTB={2:#x}".format(self._proc.comm,
                                                                         self._proc.pid, dtb)
 
-    def set_context(self, offset = None, pid = None, name = None):
-        if pid is not None:
+    def set_context(self, offset = None, pid = None, name = None, physical = False):
+        if physical and offset != None:
+            offset = pslist.linux_pslist(self._config).virtual_process_from_physical_offset(offset).obj_offset  
+        elif pid is not None:
             offsets = []
             for p in self.getpidlist():
                 if p.pid.v() == pid:

@@ -1,6 +1,6 @@
 # Volatility
 # Copyright (C) 2008-2013 Volatility Foundation
-# Copyright (C) 2011 Jamie Levy (Gleeda) <jamie.levy@gmail.com>
+# Copyright (C) 2011 Jamie Levy (Gleeda) <jamie@memoryanalysis.net>
 #
 # This file is part of Volatility.
 #
@@ -21,7 +21,7 @@
 """
 @author:       Jamie Levy (gleeda)
 @license:      GNU General Public License 2.0
-@contact:      jamie.levy@gmail.com
+@contact:      jamie@memoryanalysis.net
 @organization: Volatility Foundation
 """
 
@@ -121,6 +121,12 @@ class MFT_FILE_RECORD(obj.CType):
         return ''.join([c for c in str if (ord(c) > 31 or ord(c) == 9) and ord(c) <= 126])
 
     def add_path(self, fileinfo):
+        # it doesn't really make sense to add regular files to parent directory,
+        # since they wouldn't actually be in the middle of a file path, but at the end
+        # therefore, we'll return for regular files
+        if not self.is_directory():
+            return
+        # otherwise keep a record of the directory that we've found
         cur = MFT_PATHS_FULL.get(int(self.RecordNumber), None)
         if cur == None or cur["filename"].find("~") != -1 and fileinfo.is_valid():
             temp = {}
@@ -129,6 +135,8 @@ class MFT_FILE_RECORD(obj.CType):
             MFT_PATHS_FULL[int(self.RecordNumber)] = temp
 
     def get_full_path(self, fileinfo):
+        if self.obj_vm._config.DEBUGOUT:
+            print "Building path for file {0}".format(fileinfo.get_name())
         parent = ""
         path = self.remove_unprintable(fileinfo.get_name()) or "(Null)"
         try:
@@ -137,24 +145,32 @@ class MFT_FILE_RECORD(obj.CType):
             return path
         if int(self.RecordNumber) == 5 or int(self.RecordNumber) == 0:
             return path
+        seen = set()
         while parent != {}:
+            seen.add(parent_id)
             parent = MFT_PATHS_FULL.get(int(parent_id), {})
             if parent == {} or parent["filename"] == "" or int(parent_id) == 0 or int(parent_id) == 5:
                 return path
-            path = parent["filename"] + "\\" + path
+            path = "{0}\\{1}".format(parent["filename"], path)
             parent_id = parent["ParentDirectory"] & 0xffffff
+            if parent_id in seen:
+                return path
         return path
 
+    def is_directory(self):
+        return int(self.Flags) & 0x2
+
+    def is_file(self):
+        return int(self.Flags) & 0x2 == 0
+
+    def is_inuse(self):
+        return int(self.Flags) & 0x1 == 0x1
+
     def get_mft_type(self):
-        thetype = "In Use & " if self.Flags & 0x1 == 0x1 else ""
-        if int(self.Flags) & 0x2:
-            thetype += "Directory"
-        elif int(self.Flags) & 0x2 == 0:
-            thetype += "File"
-        return thetype.rstrip(" & ")
+        return "{0}{1}".format("In Use & " if self.is_inuse() else "",
+               "Directory" if self.is_directory() else "File")
         
     def parse_attributes(self, mft_buff, check = True, entrysize = 1024):
-
         next_attr = self.ResidentAttributes
         end = mft_buff.find("\xff\xff\xff\xff")
         if end == -1:
@@ -224,16 +240,14 @@ class MFT_FILE_RECORD(obj.CType):
                 start = next_attr.obj_offset + next_attr.ContentOffset
                 theend = min(start + next_attr.ContentSize, end)
                 if next_attr.Header.NonResidentFlag == 1:
-                    thedata = "" #"Non-Resident"
+                    thedata = "" 
                 else:
                     try:
                         contents = mft_buff[start:theend]
                     except TypeError:
                         next_attr = None
                         continue
-                    thedata = contents #"\n".join(["{0:010x}: {1:<48}  {2}".format(o, h, ''.join(c)) for o, h, c in utils.Hexdump(contents)])
-                    #if len(thedata) == 0:
-                    #    thedata = "(Empty)"
+                    thedata = contents 
                 attributes.append((attr, thedata))
                 next_off = theend
                 if next_off == start:
@@ -263,13 +277,6 @@ class MFT_FILE_RECORD(obj.CType):
             return None
 
         while attr == None and cursor <= end:
-            #bufferas = addrspace.BufferAddressSpace(self.obj_vm.get_config(), data = mft_buff)
-            #item = obj.Object('RESIDENT_ATTRIBUTE', vm = bufferas,
-            #                    offset = next_off + cursor)
-            #try:
-            #    attr = ATTRIBUTE_TYPE_ID.get(int(item.Header.Type), None)
-            #except struct.error:
-            #    return item
             try:
                 val = struct.unpack("<I", mft_buff[next_off + cursor: next_off + cursor + 4])[0]
                 attr = ATTRIBUTE_TYPE_ID.get(val, None)
@@ -302,7 +309,7 @@ class RESIDENT_ATTRIBUTE(obj.CType):
                         attributes.append(("FILE_NAME (AL)", theitem))
             except struct.error:
                 return
-            if item.Length == 0:
+            if item.Length <= 0:
                 return
             start += item.Length
 
@@ -355,16 +362,17 @@ class STANDARD_INFORMATION(obj.CType):
             self.get_type())
 
     def body(self, path, record_num, size, offset):
-        if path == "":
+        if path.strip() == "" or path == None:
             # if the path is null we just try to get the filename 
             # from our dictionary and print the body file output
             record = MFT_PATHS_FULL.get(int(record_num), {}) 
+            path = "(Possible non-base entry, extra $SI or invalid $FN)"
             if record != {}:
                 # we include with the found filename a note that this may be a 
                 # non-base entry.  the analyst can investigate these types of records
                 # on his/her own by comparing record numbers in output or examining the 
                 # given physical offset in memory for example
-                path = record["filename"] + " (Possible non-base entry, extra $SI or invalid $FN)"
+                path = "{0} {1}".format(record["filename"], path)
 
         return "[{9}MFT STD_INFO] {0} (Offset: 0x{1:x})|{2}|{3}|0|0|{4}|{5}|{6}|{7}|{8}".format(
             path,
@@ -518,7 +526,6 @@ MFT_types = {
         'EaValue': lambda x: obj.Object("Array", offset = x.obj_offset + len(x.EaName), count = x.EaValueLength, vm = x.obj_vm,
                                         target = obj.Curry(obj.Object, "unsigned char")),
     }],
-
 
     'STANDARD_INFORMATION': [0x48, {
         'CreationTime': [0x0, ['WinTimeStamp', dict(is_utc = True)]],
@@ -695,9 +702,14 @@ class MFTParser(common.AbstractWindowsCommand):
                                offset = 0)
                 temp = mft_entry.advance_one(mft_entry.ResidentAttributes.STDInfo.obj_offset + mft_entry.ResidentAttributes.ContentSize, mft_buff, self._config.ENTRYSIZE)
                 name = ""
-                if temp != None: # and temp.FileName.is_valid():
-                    mft_entry.add_path(temp.FileName)
-                    name = temp.FileName.get_name()
+                if temp != None:
+                    try:
+                        mft_entry.add_path(temp.FileName)
+                        name = temp.FileName.get_name()
+                    except struct.error:
+                        if self._config.DEBUGOUT:
+                            print "Problem entry at offset:", hex(offset)
+                        continue
                 if (int(mft_entry.RecordNumber), name) in seen:
                     continue
                 else:
@@ -723,25 +735,30 @@ class MFTParser(common.AbstractWindowsCommand):
             full = ""
             datanum = 0
             for a, i in attributes:
+                # we'll have a default file size of -1 for records missing $FN attributes
+                # note that file size found in $FN may not actually be accurate and will most likely
+                # be 0.  See Carrier, pg 363
+                size = -1
                 if a.startswith("STANDARD_INFORMATION"):
                     if full != "":
                         # if we are here, we've hit one $FN attribute for this entry already and have the full name
                         # so we can dump this $SI
-                        outfd.write("0|{0}\n".format(i.body(full, mft_entry.RecordNumber, int(mft_entry.EntryUsedSize), offset)))
+                        outfd.write("0|{0}\n".format(i.body(full, mft_entry.RecordNumber, size, offset)))
                     elif si != None:
                         # if we are here then we have more than one $SI attribute for this entry
                         # since we don't want to lose its info, we'll just dump it for now
                         # we won't have full path, but we'll have a filename most likely
-                        outfd.write("0|{0}\n".format(i.body("", mft_entry.RecordNumber, int(mft_entry.EntryUsedSize), offset)))
+                        outfd.write("0|{0}\n".format(i.body("", mft_entry.RecordNumber, size, offset)))
                     elif si == None:
                         # this is the usual case and we'll save the $SI to process after we get the full path from the $FN
                         si = i
                 elif a.startswith("FILE_NAME"):
                     if hasattr(i, "ParentDirectory"):
                         full = mft_entry.get_full_path(i)
-                        outfd.write("0|{0}\n".format(i.body(full, mft_entry.RecordNumber, int(mft_entry.EntryUsedSize), offset)))
+                        size = int(i.RealFileSize)
+                        outfd.write("0|{0}\n".format(i.body(full, mft_entry.RecordNumber, size, offset)))
                         if si != None:
-                            outfd.write("0|{0}\n".format(si.body(full, mft_entry.RecordNumber, int(mft_entry.EntryUsedSize), offset)))
+                            outfd.write("0|{0}\n".format(si.body(full, mft_entry.RecordNumber, size, offset)))
                             si = None
                 elif a.startswith("DATA"):
                     if len(str(i)) > 0:
@@ -755,7 +772,7 @@ class MFTParser(common.AbstractWindowsCommand):
 
             if si != None:
                 # here we have a lone $SI in an MFT entry with no valid $FN.  This is most likely a non-base entry
-                outfd.write("0|{0}\n".format(si.body("", mft_entry.RecordNumber, int(mft_entry.EntryUsedSize), offset)))
+                outfd.write("0|{0}\n".format(si.body("", mft_entry.RecordNumber, -1, offset)))
 
     def render_text(self, outfd, data):
         if self._config.DUMP_DIR != None and not os.path.isdir(self._config.DUMP_DIR):
@@ -764,7 +781,7 @@ class MFTParser(common.AbstractWindowsCommand):
         for offset, mft_entry, attributes in data:
             if len(attributes) == 0:
                 continue
-            outfd.write(border + "\n")
+            outfd.write("{0}\n".format(border))
             outfd.write("MFT entry found at offset 0x{0:x}\n".format(offset))
             outfd.write("Attribute: {0}\n".format(mft_entry.get_mft_type())) 
             outfd.write("Record Number: {0}\n".format(mft_entry.RecordNumber))
@@ -808,4 +825,4 @@ class MFTParser(common.AbstractWindowsCommand):
                 elif a == "OBJECT_ID":
                     outfd.write("\n$OBJECT_ID\n")
                     outfd.write(str(i))
-            outfd.write("\n" + border + "\n") 
+            outfd.write("\n{0}\n".format(border))

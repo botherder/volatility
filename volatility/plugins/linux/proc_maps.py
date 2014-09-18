@@ -49,25 +49,10 @@ class linux_proc_maps(linux_pslist.linux_pslist):
                                   ("Major", "6"),
                                   ("Minor", "6"),
                                   ("Inode", "10"),
-                                  ("File Path", "80"),                    
+                                  ("File Path", ""),                    
                                  ]) 
         for task, vma in data:
-
-            if vma.vm_file:
-                inode = vma.vm_file.dentry.d_inode
-                major, minor = inode.i_sb.major, inode.i_sb.minor
-                ino = inode.i_ino
-                pgoff = vma.vm_pgoff << 12
-                fname = linux_common.get_path(task, vma.vm_file)
-            else:
-                (major, minor, ino, pgoff) = [0] * 4
-
-                if vma.vm_start <= task.mm.start_brk and vma.vm_end >= task.mm.brk:
-                    fname = "[heap]"
-                elif vma.vm_start <= task.mm.start_stack and vma.vm_end >= task.mm.start_stack:
-                    fname = "[stack]"
-                else:
-                    fname = ""
+            (fname, major, minor, ino, pgoff) = vma.info(task)
 
             self.table_row(outfd, task.pid, 
                 vma.vm_start,

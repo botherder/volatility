@@ -18,6 +18,14 @@
 # along with Volatility.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+"""
+@author:       The Volatility Foundation
+@license:      GNU General Public License 2.0
+@contact:      awalters@4tphi.net
+
+This file provides support for Windows 8.
+"""
+
 import struct
 import volatility.plugins.overlays.windows.windows as windows
 import volatility.obj as obj
@@ -109,6 +117,27 @@ class _PSP_CID_TABLE32(_HANDLE_TABLE32):
 
 class _PSP_CID_TABLE64(_HANDLE_TABLE64):
     """PspCidTable for 64-bit Windows 8 and Server 2012"""
+
+    def get_item(self, entry, handle_value = 0):
+        """Starting with 8/2012 x64 the PsPCidTable pointers
+        go directly to an object rather than an object header.
+        """
+
+        if entry.LowValue == 0:
+            return obj.NoneObject("LowValue pointer is invalid")
+
+        body_offset = self.obj_vm.profile.get_obj_offset("_OBJECT_HEADER", "Body")
+        head_offset = self.decode_pointer(entry.LowValue) - body_offset
+
+        return obj.Object("_OBJECT_HEADER", 
+                          offset = head_offset, 
+                          vm = self.obj_vm, 
+                          parent = entry, 
+                          handle_value = handle_value)
+
+class _PSP_CID_TABLE_81R264(_PSP_CID_TABLE64):
+    """PspCidTable for 64-bit Windows 8.1 and Server 2012 R2"""
+    DECODE_MAGIC = 0x10
 
 class _LDR_DATA_TABLE_ENTRY(pe_vtypes._LDR_DATA_TABLE_ENTRY):
     """A class for DLL modules"""
@@ -358,9 +387,10 @@ class Win8ObjectClasses(obj.ProfileModification):
         else:
             if (major, minor) == (6, 3):
                 handletable = _HANDLE_TABLE_81R264
+                pspcidtable = _PSP_CID_TABLE_81R264
             else:
                 handletable = _HANDLE_TABLE64
-            pspcidtable = _PSP_CID_TABLE64
+                pspcidtable = _PSP_CID_TABLE64
 
         if (major, minor) == (6, 3):
             objheader = _OBJECT_HEADER_81R2
@@ -375,7 +405,7 @@ class Win8ObjectClasses(obj.ProfileModification):
                 })
 
 class Win8SP0x64(obj.Profile):
-    """ A Profile for Windows 8 SP0 x64 """
+    """ A Profile for Windows 8 x64 """
     _md_memory_model = '64bit'
     _md_os = 'windows'
     _md_major = 6
@@ -392,8 +422,8 @@ class Win8SP1x64(obj.Profile):
     _md_build = 9600
     _md_vtype_module = 'volatility.plugins.overlays.windows.win8_sp1_x64_vtypes'
 
-class Win2012SP0x64(Win8SP0x64):
-    """ A Profile for Windows Server 2012 SP0 x64 """
+class Win2012x64(Win8SP0x64):
+    """ A Profile for Windows Server 2012 x64 """
     _md_build = 9201 ##FIXME: fake build number to indicate server 2012 vs windows 8
 
 class Win2012R2x64(Win8SP1x64):
@@ -401,7 +431,7 @@ class Win2012R2x64(Win8SP1x64):
     _md_build = 9601 ##FIXME: fake build number to indicate server 2012 R2 vs windows 8.1
 
 class Win8SP0x86(obj.Profile):
-    """ A Profile for Windows 8 SP0 x86 """
+    """ A Profile for Windows 8 x86 """
     _md_memory_model = '32bit'
     _md_os = 'windows'
     _md_major = 6
@@ -410,7 +440,7 @@ class Win8SP0x86(obj.Profile):
     _md_vtype_module = 'volatility.plugins.overlays.windows.win8_sp0_x86_vtypes'
 
 class Win8SP1x86(obj.Profile):
-    """ A Profile for Windows 8 SP1 x86 """
+    """ A Profile for Windows 8.1 x86 """
     _md_memory_model = '32bit'
     _md_os = 'windows'
     _md_major = 6
